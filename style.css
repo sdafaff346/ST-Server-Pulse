@@ -67,3 +67,5 @@
 #sp_settings textarea { width: 100%; }
 #sp_settings small { display: block; opacity: 0.75; margin: 2px 0 6px; }
 #sp_settings .flex-container .menu_button { margin: 4px 4px 0 0; }
+.sp-dash h4 .sp-probe-btn { display: inline-flex; font-size: 0.75em; padding: 1px 8px; margin: 0 0 0 8px; vertical-align: middle; }
+#sp_settings select { width: 100%; }

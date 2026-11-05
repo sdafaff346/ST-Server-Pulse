@@ -8,7 +8,7 @@ const LOG = '[ServerPulse]';
 const MIN = 60_000;
 const HOUR = 60 * MIN;
 const DAY = 24 * HOUR;
-const CAP = { gens: 5000, pings: 8000, ratings: 3000 };
+const CAP = { gens: 5000, pings: 8000, ratings: 3000, probes: 5000 };
 const SKIP_TYPES = new Set(['quiet', 'impersonate']);
 
 const defaultSettings = Object.freeze({
@@ -18,6 +18,8 @@ const defaultSettings = Object.freeze({
     pingIntervalMin: 5,
     pingSillyTavern: true,
     pingTargets: '',
+    probeIntervalMin: 30,
+    probeProfileId: '',
     showBadge: true,
     perConnection: true,
     halfLifeDays: 21,
@@ -38,13 +40,14 @@ function getSettings() {
     return extensionSettings[MODULE];
 }
 
-let data = { gens: [], pings: [], ratings: [], lastPromptAt: 0, lastPingAt: 0 };
+let data = { gens: [], pings: [], ratings: [], probes: [], lastPromptAt: 0, lastPingAt: 0, lastProbeAt: 0 };
 let saveTimer = null;
 
 async function loadData() {
     try {
         const stored = await SillyTavern.libs.localforage.getItem(STORE_KEY);
         if (stored && typeof stored === 'object') data = { ...data, ...stored };
+        if (!Array.isArray(data.probes)) data.probes = [];
     } catch (err) {
         console.warn(LOG, 'load failed', err);
     }
@@ -135,7 +138,20 @@ export function metricsSnapshot(d, key, now) {
     const pings = d.pings.filter(p => now - p.t <= 30 * MIN && p.t <= now);
     const pingFail = pings.length ? pings.filter(p => !p.ok).length / pings.length : null;
 
-    return { n, failRate: n ? fails / n : null, medMs, medTtft, latRatio, pingFail };
+    // API probes (tiny real requests) for this connection
+    const allProbes = (d.probes || []).filter(p => p.key === key && p.t <= now);
+    let probes = allProbes.filter(p => now - p.t <= 30 * MIN);
+    if (!probes.length) probes = allProbes.filter(p => now - p.t <= 2 * HOUR).slice(-2);
+    const probeN = probes.length;
+    const probeFail = probeN ? probes.filter(p => !p.ok).length / probeN : null;
+    const probeMs = median(probes.filter(p => p.ok).map(p => p.ms));
+    const probeBase = allProbes.filter(p => p.ok && now - p.t <= 14 * DAY);
+    const probeLat = probeMs && probeBase.length >= 5 ? probeMs / median(probeBase.map(p => p.ms)) : null;
+
+    return {
+        n, failRate: n ? fails / n : null, medMs, medTtft,
+        latRatio: latRatio ?? probeLat, pingFail, probeN, probeFail, probeMs,
+    };
 }
 
 function features(s) {
@@ -144,6 +160,7 @@ function features(s) {
         s.failRate ?? 0,
         s.latRatio ? clamp(Math.log2(s.latRatio), -2, 3) : 0,
         s.pingFail ?? 0,
+        s.probeFail ?? 0,
     ];
 }
 
@@ -152,12 +169,13 @@ function heuristicScore(s) {
     if (s.failRate != null) score -= 3.2 * s.failRate;
     if (s.latRatio) score -= 0.9 * Math.max(0, Math.log2(s.latRatio)) - 0.3 * Math.max(0, -Math.log2(s.latRatio));
     if (s.pingFail != null) score -= 2 * s.pingFail;
+    if (s.probeFail != null) score -= 2.8 * s.probeFail;
     return clamp(score, 1, 5);
 }
 
 // Weighted ridge regression: rating ~ features(snapshot)
 function fitRidge(rows, lambda = 1) {
-    const k = 4;
+    const k = rows[0].x.length;
     const A = Array.from({ length: k }, () => new Array(k).fill(0));
     const b = new Array(k).fill(0);
     for (const { x, y, w } of rows) {
@@ -240,7 +258,7 @@ export function predict(d, settings, key, now) {
         .filter(r => r.snap && r.snap.n > 0)
         .map(r => ({ x: features(r.snap), y: r.score, w: decay(now - r.t, settings.halfLifeDays) }));
     const beta = rows.length >= 6 ? fitRidge(rows) : null;
-    const hasLive = snap.n > 0 || snap.pingFail != null;
+    const hasLive = snap.n > 0 || snap.pingFail != null || snap.probeFail != null;
     let metricScore = null;
     if (hasLive) {
         const x = features(snap);
@@ -254,7 +272,7 @@ export function predict(d, settings, key, now) {
             metricScore = heur;
         }
         // Many failures right now: never report better than the rule-based score
-        if ((snap.failRate ?? 0) >= 0.5) metricScore = Math.min(metricScore, heur);
+        if ((snap.failRate ?? 0) >= 0.5 || (snap.probeFail ?? 0) >= 0.5) metricScore = Math.min(metricScore, heur);
     }
 
     let score = null;
@@ -277,11 +295,12 @@ export function predict(d, settings, key, now) {
         reasons.push(`최근 생성 ${snap.n}회 중 실패 ${Math.round((snap.failRate || 0) * snap.n)}회`);
         if (snap.medMs) reasons.push(`응답 ${fmtMs(snap.medMs)}${snap.latRatio ? ` (평소의 ${snap.latRatio.toFixed(1)}배)` : ''}`);
     }
+    if (snap.probeN) reasons.push(`API 측정 ${snap.probeN}회 중 실패 ${Math.round((snap.probeFail || 0) * snap.probeN)}회${snap.probeMs ? `, 응답 ${fmtMs(snap.probeMs)}` : ''}${!snap.n && snap.latRatio ? ` (평소의 ${snap.latRatio.toFixed(1)}배)` : ''}`);
     if (snap.pingFail != null) reasons.push(`핑 실패율 ${Math.round(snap.pingFail * 100)}%`);
     if (prior.mean != null && prior.neff >= 0.5) reasons.push(`이 시간대 평소 평가 ${prior.mean.toFixed(1)}점`);
     if (beta) reasons.push(`내 평가 ${rows.length}개로 학습된 모델 사용`);
 
-    const neff = prior.neff + (snap.n ? Math.min(snap.n, 5) : 0) + (beta ? 2 : 0);
+    const neff = prior.neff + (snap.n ? Math.min(snap.n, 5) : 0) + (snap.probeN ? Math.min(snap.probeN, 2) : 0) + (beta ? 2 : 0);
     const confidence = score == null ? '없음' : neff >= 8 ? '높음' : neff >= 3 ? '보통' : '낮음';
 
     const forecast = [];
@@ -406,6 +425,88 @@ async function runPings() {
     refreshBadge();
 }
 
+// ---------------------------------------------------------------- API probe
+
+let probeRunning = false;
+
+/** Sends a system + user prompt through a connection profile, or the current connection. */
+async function callLLM(system, user, maxTokens, profileId) {
+    const ctx = SillyTavern.getContext();
+    if (profileId && ctx.ConnectionManagerRequestService) {
+        const res = await ctx.ConnectionManagerRequestService.sendRequest(
+            profileId,
+            [{ role: 'system', content: system }, { role: 'user', content: user }],
+            maxTokens,
+            { stream: false, extractData: true, includePreset: true, includeInstruct: true },
+        );
+        return typeof res === 'string' ? res : (res?.content ?? '');
+    }
+    return await ctx.generateRaw({ systemPrompt: system, prompt: user, responseLength: maxTokens });
+}
+
+function profileName(id) {
+    if (!id) return '';
+    const p = SillyTavern.getContext().extensionSettings.connectionManager?.profiles?.find(x => x.id === id);
+    return p?.name || '';
+}
+
+/**
+ * Sends a tiny real request to the API and records success and latency.
+ * Results are stored under the current main connection, so the prediction for it improves
+ * even when the probe goes through a cheaper profile on the same server.
+ */
+async function runProbe({ manual = false } = {}) {
+    const s = getSettings();
+    if (probeRunning || pending) {
+        if (manual) toastr.info('생성 중이라 나중에 측정할게요.');
+        return null;
+    }
+    const key = connKey();
+    const now = Date.now();
+    data.lastProbeAt = now;
+    if (!manual) {
+        // A real generation recently? That already tells us how the server is doing: save the request
+        const recent = data.gens.some(g => g.key === key && !g.stopped && now - g.t < s.probeIntervalMin * MIN);
+        if (recent) return null;
+    }
+    probeRunning = true;
+    const via = profileName(s.probeProfileId);
+    const t0 = performance.now();
+    let ok = false;
+    let empty = false;
+    let error = '';
+    try {
+        const text = await callLLM(
+            'This is an automated server health check. Reply with exactly: OK',
+            'ping',
+            64,
+            via ? s.probeProfileId : '',
+        );
+        ok = true;
+        empty = !String(text || '').trim();
+    } catch (err) {
+        const msg = err?.cause?.message || err?.message || String(err);
+        // The server answered but the text was empty (e.g. reasoning used every token): it is alive
+        if (/No message generated/i.test(msg)) {
+            ok = true;
+            empty = true;
+        } else {
+            error = msg.slice(0, 200);
+        }
+    } finally {
+        probeRunning = false;
+    }
+    const rec = { t: now, key, ok, ms: Math.round(performance.now() - t0), empty, via, error };
+    data.probes.push(rec);
+    saveData();
+    refreshBadge();
+    if (manual) {
+        if (ok) toastr.success(`API 응답 ${fmtMs(rec.ms)}${via ? ` (${via} 경유)` : ''}`, 'Server Pulse');
+        else toastr.error(error || '응답 없음', 'API 측정 실패');
+    }
+    return rec;
+}
+
 // ---------------------------------------------------------------- rating
 
 let ratingToast = null;
@@ -501,6 +602,22 @@ function pingTable(now) {
     return `<table class="sp-table"><tr><th>대상</th><th>마지막</th><th>24시간 가동률</th><th>지연(중앙값)</th></tr>${rows}</table>`;
 }
 
+function probeTable(now) {
+    const byKey = new Map();
+    for (const p of (data.probes || []).filter(x => now - x.t <= DAY)) {
+        if (!byKey.has(p.key)) byKey.set(p.key, []);
+        byKey.get(p.key).push(p);
+    }
+    if (!byKey.size) return '<p class="sp-muted">API 측정 기록이 없어요. 최근에 실제 생성이 있었으면 측정을 건너뛰어요.</p>';
+    const rows = [...byKey].map(([k, ps]) => {
+        const last = ps.at(-1);
+        const ok = ps.filter(p => p.ok);
+        const lastTxt = last.ok ? '<span class="sp-up">성공</span>' : `<span class="sp-down" title="${esc(last.error)}">실패</span>`;
+        return `<tr><td>${esc(k)}${last.via ? `<br><small>${esc(last.via)} 경유</small>` : ''}</td><td>${ps.length}</td><td>${Math.round(ok.length / ps.length * 100)}%</td><td>${fmtMs(median(ok.map(p => p.ms)))}</td><td>${lastTxt}</td></tr>`;
+    }).join('');
+    return `<table class="sp-table"><tr><th>연결</th><th>측정</th><th>성공률</th><th>응답(중앙값)</th><th>마지막</th></tr>${rows}</table>`;
+}
+
 function forecastHtml(p) {
     const bars = p.forecast.map(f => {
         const h = new Date(f.t).getHours();
@@ -556,9 +673,11 @@ async function openDashboard() {
         ${heatmapHtml(now, s)}
         <h4>최근 24시간 생성</h4>
         ${statsTable(now)}
+        <h4>API 직접 측정 (24시간) <span class="menu_button sp-probe-btn" title="작은 요청을 한 번 보내 응답 시간을 잽니다">지금 측정</span></h4>
+        ${probeTable(now)}
         <h4>핑</h4>
         ${pingTable(now)}
-        <p class="sp-muted">평가 ${data.ratings.length}개 · 생성 기록 ${data.gens.length}개 · 핑 ${data.pings.length}개${p.scoped ? ' · 이 연결의 평가만 사용 중' : ''}</p>
+        <p class="sp-muted">평가 ${data.ratings.length}개 · 생성 기록 ${data.gens.length}개 · API 측정 ${data.probes.length}개 · 핑 ${data.pings.length}개${p.scoped ? ' · 이 연결의 평가만 사용 중' : ''}</p>
     </div>`;
     const { Popup, POPUP_TYPE } = SillyTavern.getContext();
     await new Popup(html, POPUP_TYPE.TEXT, '', { wide: true, allowVerticalScrolling: true, okButton: '닫기' }).show();
@@ -583,6 +702,11 @@ function createSettingsUI() {
                 <input id="sp_rate_int" class="text_pole" type="number" min="0" max="1440" step="5" />
                 <label for="sp_rate_min">물어보기 전 최소 생성 횟수</label>
                 <input id="sp_rate_min" class="text_pole" type="number" min="0" max="50" step="1" />
+                <label for="sp_probe_int">API 직접 측정 간격(분, 0 = 끔)</label>
+                <input id="sp_probe_int" class="text_pole" type="number" min="0" max="1440" step="5" />
+                <label for="sp_probe_profile">측정에 쓸 연결</label>
+                <select id="sp_probe_profile" class="text_pole"></select>
+                <small>"OK"만 답하라는 아주 짧은 요청(최대 64토큰)을 보내 실제 응답 시간을 잽니다. 그 사이 실제 생성이 있었으면 건너뛰어 비용을 아껴요. 같은 서버(프록시)의 싼 모델 프로필을 고르면 더 저렴해요.</small>
                 <label for="sp_ping_int">핑 간격(분, 0 = 끔)</label>
                 <input id="sp_ping_int" class="text_pole" type="number" min="0" max="120" step="1" />
                 <label class="checkbox_label"><input id="sp_ping_st" type="checkbox" /><span>SillyTavern 서버 자체도 핑</span></label>
@@ -592,6 +716,7 @@ function createSettingsUI() {
                 <div class="flex-container">
                     <div id="sp_open" class="menu_button menu_button_icon"><i class="fa-solid fa-heart-pulse"></i><span>대시보드</span></div>
                     <div id="sp_rate_now" class="menu_button menu_button_icon"><i class="fa-solid fa-star"></i><span>지금 평가</span></div>
+                    <div id="sp_probe_now" class="menu_button menu_button_icon"><i class="fa-solid fa-satellite-dish"></i><span>지금 측정</span></div>
                     <div id="sp_export" class="menu_button menu_button_icon"><i class="fa-solid fa-download"></i><span>내보내기</span></div>
                     <div id="sp_import" class="menu_button menu_button_icon"><i class="fa-solid fa-upload"></i><span>가져오기</span></div>
                     <div id="sp_reset" class="menu_button menu_button_icon redWarningBG"><i class="fa-solid fa-trash"></i><span>기록 초기화</span></div>
@@ -624,6 +749,12 @@ function createSettingsUI() {
     bindNum('sp_rate_int', 'ratingIntervalMin', 0, 1440);
     bindNum('sp_rate_min', 'ratingMinGens', 0, 50);
     bindNum('sp_ping_int', 'pingIntervalMin', 0, 120);
+    bindNum('sp_probe_int', 'probeIntervalMin', 0, 1440);
+    const sel = $('sp_probe_profile');
+    fillProfileSelect(sel, s.probeProfileId);
+    sel.addEventListener('focus', () => fillProfileSelect(sel, s.probeProfileId));
+    sel.addEventListener('change', () => { s.probeProfileId = sel.value; saveSettingsDebounced(); });
+    $('sp_probe_now').addEventListener('click', () => runProbe({ manual: true }));
     $('sp_targets').value = s.pingTargets;
     $('sp_targets').addEventListener('change', () => { s.pingTargets = $('sp_targets').value; saveSettingsDebounced(); });
 
@@ -643,7 +774,7 @@ function createSettingsUI() {
         if (!file) return;
         try {
             const incoming = JSON.parse(await file.text());
-            for (const k of ['gens', 'pings', 'ratings']) {
+            for (const k of ['gens', 'pings', 'ratings', 'probes']) {
                 if (!Array.isArray(incoming[k])) continue;
                 const seen = new Set(data[k].map(x => `${x.t}|${x.key ?? x.target}`));
                 data[k].push(...incoming[k].filter(x => x && Number.isFinite(x.t) && !seen.has(`${x.t}|${x.key ?? x.target}`)));
@@ -659,13 +790,26 @@ function createSettingsUI() {
     });
     $('sp_reset').addEventListener('click', async () => {
         const { Popup, POPUP_RESULT } = SillyTavern.getContext();
-        const ok = await Popup.show.confirm('기록 초기화', '평가·생성·핑 기록을 모두 지울까요? 되돌릴 수 없어요.');
+        const ok = await Popup.show.confirm('기록 초기화', '평가·생성·API 측정·핑 기록을 모두 지울까요? 되돌릴 수 없어요.');
         if (ok !== POPUP_RESULT.AFFIRMATIVE) return;
-        data = { gens: [], pings: [], ratings: [], lastPromptAt: Date.now(), lastPingAt: 0 };
+        data = { gens: [], pings: [], ratings: [], probes: [], lastPromptAt: Date.now(), lastPingAt: 0, lastProbeAt: 0 };
         saveData();
         refreshBadge();
         toastr.success('초기화했어요.');
     });
+}
+
+function fillProfileSelect(select, currentId) {
+    const ctx = SillyTavern.getContext();
+    let profiles = [];
+    try {
+        profiles = ctx.ConnectionManagerRequestService?.getSupportedProfiles?.() ?? [];
+    } catch {
+        profiles = []; // Connection Manager disabled
+    }
+    select.innerHTML = '<option value="">현재 연결로 측정</option>'
+        + profiles.map(p => `<option value="${esc(p.id)}">${esc(p.name)} (프로필)</option>`).join('');
+    select.value = profiles.some(p => p.id === currentId) ? currentId : '';
 }
 
 function registerCommands() {
@@ -679,6 +823,15 @@ function registerCommands() {
         },
         returns: 'predicted server score (1-5) for the current connection',
         helpString: '<div>서버 상태 대시보드를 열고 현재 예측 점수(1~5)를 반환합니다.</div>',
+    }));
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'pulse-probe',
+        callback: async () => {
+            const rec = await runProbe({ manual: true });
+            return rec ? (rec.ok ? String(rec.ms) : 'fail') : '';
+        },
+        returns: 'probe latency in ms, or "fail"',
+        helpString: '<div>API에 아주 짧은 요청을 보내 응답 시간(ms)을 재고 기록합니다.</div>',
     }));
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
         name: 'pulse-rate',
@@ -720,9 +873,19 @@ if (globalThis.SillyTavern?.getContext) {
             for (const ev of [event_types.MAIN_API_CHANGED, event_types.CHATCOMPLETION_MODEL_CHANGED, event_types.CHATCOMPLETION_SOURCE_CHANGED, event_types.CONNECTION_PROFILE_LOADED]) {
                 if (ev) eventSource.on(ev, () => setTimeout(refreshBadge, 200));
             }
+            for (const ev of [event_types.CONNECTION_PROFILE_CREATED, event_types.CONNECTION_PROFILE_DELETED, event_types.CONNECTION_PROFILE_UPDATED]) {
+                if (ev) eventSource.on(ev, () => {
+                    const sel = document.getElementById('sp_probe_profile');
+                    if (sel) fillProfileSelect(sel, getSettings().probeProfileId);
+                });
+            }
 
             // Rating buttons live in toasts and popups: one delegated handler
             document.addEventListener('click', (e) => {
+                if (e.target instanceof Element && e.target.closest('.sp-probe-btn')) {
+                    runProbe({ manual: true });
+                    return;
+                }
                 const btn = e.target instanceof Element ? e.target.closest('.sp-rate-btn') : null;
                 if (!btn) return;
                 if (addRating(btn.dataset.score, btn.closest('.toast') ? 'prompt' : 'manual')) {
@@ -736,6 +899,8 @@ if (globalThis.SillyTavern?.getContext) {
                 const st = getSettings();
                 if (!st.enabled) return;
                 if (st.pingIntervalMin > 0 && Date.now() - data.lastPingAt >= st.pingIntervalMin * MIN) runPings();
+                if (st.probeIntervalMin > 0 && document.visibilityState === 'visible'
+                    && Date.now() - data.lastProbeAt >= st.probeIntervalMin * MIN) runProbe();
                 maybePrompt();
                 refreshBadge();
             }, MIN);
