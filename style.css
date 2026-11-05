@@ -9,22 +9,31 @@
 /* floating badge */
 #sp_badge.sp-badge {
     position: fixed;
-    top: calc(var(--topBarBlockSize, 50px) + 6px);
-    right: 8px;
-    z-index: 3000;
+    /* Above ST's top bar (3005) so nothing in the header strip can cover it; below popups and toasts */
+    z-index: 3010;
     display: flex;
     align-items: center;
     gap: 5px;
-    padding: 2px 9px;
-    border-radius: 12px;
+    padding: 4px 10px;
+    min-height: 28px;
+    border-radius: 14px;
     font-size: 0.85em;
     cursor: pointer;
+    pointer-events: auto !important;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
     background: var(--SmartThemeBlurTintColor, rgba(0, 0, 0, 0.5));
     border: 1px solid var(--sp-c);
     color: var(--SmartThemeBodyColor, #ddd);
     backdrop-filter: blur(6px);
     user-select: none;
 }
+#sp_badge.sp-pos-top-right { top: calc(var(--topBarBlockSize, 50px) + 6px); right: 8px; }
+#sp_badge.sp-pos-top-left { top: calc(var(--topBarBlockSize, 50px) + 6px); left: 8px; }
+#sp_badge.sp-pos-bottom-right { bottom: calc(var(--bottomFormBlockSize, 50px) + 20px); right: 8px; }
+#sp_badge.sp-pos-bottom-left { bottom: calc(var(--bottomFormBlockSize, 50px) + 20px); left: 8px; }
+/* Hide while a top drawer is open so it never sits on top of drawer content */
+body:has(#top-settings-holder .drawer-content.openDrawer) #sp_badge { display: none; }
 #sp_badge .sp-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--sp-c); }
 
 /* rating prompt */
@@ -64,7 +73,7 @@
 .sp-up { color: #2fae5f; }
 .sp-down { color: #d94040; }
 
-#sp_settings textarea { width: 100%; }
+#sp_settings textarea, #sp_settings select { width: 100%; }
 #sp_settings small { display: block; opacity: 0.75; margin: 2px 0 6px; }
 #sp_settings .flex-container .menu_button { margin: 4px 4px 0 0; }
 .sp-dash h4 .sp-probe-btn { display: inline-flex; font-size: 0.75em; padding: 1px 8px; margin: 0 0 0 8px; vertical-align: middle; }

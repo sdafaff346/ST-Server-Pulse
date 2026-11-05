@@ -25,6 +25,7 @@ const defaultSettings = Object.freeze({
     probeUser: '',
     probeMaxTokens: 16,
     showBadge: true,
+    badgePos: 'top-right',
     perConnection: true,
     halfLifeDays: 21,
 });
@@ -576,11 +577,15 @@ function refreshBadge() {
     if (!el) {
         el = document.createElement('div');
         el.id = 'sp_badge';
-        el.addEventListener('click', openDashboard);
-        document.body.appendChild(el);
+        el.setAttribute('role', 'button');
+        el.tabIndex = 0;
+        bindTap(el, openDashboard);
+        el.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openDashboard(); } });
     }
+    // Keep it the last child of body so later overlays from themes do not end up on top of it
+    if (el.parentElement !== document.body || document.body.lastElementChild !== el) document.body.appendChild(el);
     const p = predict(data, s, connKey(), Date.now());
-    el.className = `sp-badge ${p.label.cls}`;
+    el.className = `sp-badge sp-pos-${s.badgePos || 'top-right'} ${p.label.cls}`;
     el.innerHTML = `<span class="sp-dot"></span>${p.score == null ? '?' : p.score.toFixed(1)}`;
     el.title = `서버 상태: ${p.label.text} (신뢰도 ${p.confidence})\n${p.reasons.join('\n')}\n클릭하면 자세히`;
 }
@@ -665,7 +670,59 @@ function heatmapHtml(now, s) {
     return `<div class="sp-heatmap">${rows}<div class="sp-hm-row"><span class="sp-hm-day"></span>${Array.from({ length: 24 }, (_, h) => `<span class="sp-hm-lab">${h % 6 === 0 ? h : ''}</span>`).join('')}</div></div>`;
 }
 
+/**
+ * Fires on a real tap/click even when another script cancels the synthetic click on touch screens:
+ * listens to pointerup (no drag) and click, and ignores the click that follows a handled pointerup.
+ */
+function bindTap(el, fn) {
+    let down = null;
+    let handledAt = 0;
+    const fire = (e) => {
+        handledAt = Date.now();
+        e.stopPropagation();
+        fn();
+    };
+    el.addEventListener('pointerdown', (e) => { down = { x: e.clientX, y: e.clientY, t: Date.now() }; }, true);
+    el.addEventListener('pointerup', (e) => {
+        if (!down) return;
+        const moved = Math.hypot(e.clientX - down.x, e.clientY - down.y);
+        const quick = Date.now() - down.t < 800;
+        down = null;
+        if (moved < 10 && quick) fire(e);
+    }, true);
+    el.addEventListener('click', (e) => {
+        if (Date.now() - handledAt < 700) return;
+        fire(e);
+    }, true);
+}
+
+let dashboardOpen = false;
+
 async function openDashboard() {
+    if (dashboardOpen) return;
+    dashboardOpen = true;
+    try {
+        await renderDashboard();
+    } catch (err) {
+        console.error(LOG, 'dashboard failed', err);
+        toastr.error(String(err?.message || err), 'Server Pulse');
+    } finally {
+        dashboardOpen = false;
+    }
+}
+
+function addWandMenuItem() {
+    const menu = document.getElementById('extensionsMenu');
+    if (!menu || document.getElementById('sp_wand_item')) return;
+    const item = document.createElement('div');
+    item.id = 'sp_wand_item';
+    item.className = 'list-group-item flex-container flexGap5';
+    item.innerHTML = '<div class="fa-solid fa-heart-pulse extensionsMenuExtensionButton"></div><span>서버 상태 (Server Pulse)</span>';
+    item.addEventListener('click', () => openDashboard());
+    menu.appendChild(item);
+}
+
+async function renderDashboard() {
     const s = getSettings();
     const now = Date.now();
     const key = connKey();
@@ -709,6 +766,14 @@ function createSettingsUI() {
             <div class="inline-drawer-content">
                 <label class="checkbox_label"><input id="sp_enabled" type="checkbox" /><span>켜기</span></label>
                 <label class="checkbox_label"><input id="sp_badge_toggle" type="checkbox" /><span>화면에 상태 배지 표시</span></label>
+                <label for="sp_badge_pos">배지 위치</label>
+                <select id="sp_badge_pos" class="text_pole">
+                    <option value="top-right">오른쪽 위</option>
+                    <option value="top-left">왼쪽 위</option>
+                    <option value="bottom-right">오른쪽 아래</option>
+                    <option value="bottom-left">왼쪽 아래</option>
+                </select>
+                <small>배지가 눌리지 않거나 다른 버튼과 겹치면 위치를 바꿔 보세요. 마술봉(확장) 메뉴의 "서버 상태"로도 열 수 있어요.</small>
                 <label class="checkbox_label"><input id="sp_per_conn" type="checkbox" /><span>연결(모델)별로 따로 예측</span></label>
                 <label for="sp_rate_int">평가 물어보는 간격(분, 0 = 안 물음)</label>
                 <input id="sp_rate_int" class="text_pole" type="number" min="0" max="1440" step="5" />
@@ -765,6 +830,8 @@ function createSettingsUI() {
     bindCheck('sp_enabled', 'enabled', refreshBadge);
     bindCheck('sp_badge_toggle', 'showBadge', refreshBadge);
     bindCheck('sp_per_conn', 'perConnection', refreshBadge);
+    $('sp_badge_pos').value = s.badgePos || 'top-right';
+    $('sp_badge_pos').addEventListener('change', () => { s.badgePos = $('sp_badge_pos').value; saveSettingsDebounced(); refreshBadge(); });
     bindCheck('sp_ping_st', 'pingSillyTavern');
     bindNum('sp_rate_int', 'ratingIntervalMin', 0, 1440);
     bindNum('sp_rate_min', 'ratingMinGens', 0, 50);
@@ -891,6 +958,7 @@ if (globalThis.SillyTavern?.getContext) {
             await loadData();
             createSettingsUI();
             registerCommands();
+            addWandMenuItem();
             watchToasts();
 
             eventSource.on(event_types.GENERATION_STARTED, onGenStarted);
