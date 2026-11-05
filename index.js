@@ -551,7 +551,25 @@ function showRatingPrompt() {
         escapeHtml: false, timeOut: 120_000, extendedTimeOut: 30_000, tapToDismiss: false, closeButton: true,
         onHidden: () => { ratingToast = null; },
     });
-    ratingToast?.find?.('.sp-skip').on('click', () => toastr.clear(ratingToast));
+    ratingToast?.find?.('.sp-skip').on('click', (e) => { e.stopPropagation(); closeRatingToast(); });
+}
+
+/**
+ * Closes the rating toast for sure. toastr.clear() refuses to hide a toast that contains the
+ * focused element, and the clicked button is focused, so blur first and remove it directly.
+ */
+function closeRatingToast(delay = 0) {
+    const t = ratingToast;
+    ratingToast = null;
+    if (!t) return;
+    if (t[0]?.contains(document.activeElement)) document.activeElement.blur();
+    setTimeout(() => {
+        try {
+            t.fadeOut(200, () => t.remove());
+        } catch {
+            t.remove?.();
+        }
+    }, delay);
 }
 
 function maybePrompt() {
@@ -984,9 +1002,17 @@ if (globalThis.SillyTavern?.getContext) {
                 }
                 const btn = e.target instanceof Element ? e.target.closest('.sp-rate-btn') : null;
                 if (!btn) return;
-                if (addRating(btn.dataset.score, btn.closest('.toast') ? 'prompt' : 'manual')) {
+                e.stopPropagation();
+                const inToast = btn.closest('.toast');
+                if (!addRating(btn.dataset.score, inToast ? 'prompt' : 'manual')) return;
+                if (inToast) {
+                    // Confirm inside the same toast, then close it
+                    const box = inToast.querySelector('.sp-prompt');
+                    if (box) box.innerHTML = `<b>${esc(btn.dataset.score)}점</b>으로 기록했어요. 고마워요!`;
+                    closeRatingToast(1200);
+                } else {
                     toastr.success(`${btn.dataset.score}점으로 기록했어요.`);
-                    if (ratingToast) toastr.clear(ratingToast);
+                    btn.blur();
                 }
             });
 
