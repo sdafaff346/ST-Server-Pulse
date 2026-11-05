@@ -3,8 +3,10 @@
 AI 서버 상태를 자동으로 기록하고, 가끔 묻는 내 평가(1~5점)를 학습해 지금과 앞으로 24시간 상태를 예측합니다.
 
 ## 설치
-1. 이 폴더(`ST-Server-Pulse`)를 `SillyTavern/data/<사용자>/extensions/` 에 복사
-2. ST 새로고침 → 확장 패널 → "Server Pulse"
+1. SillyTavern의 확장(Extensions) 패널 → **확장 설치(Install extension)**
+2. 아래 주소를 붙여 넣고 설치
+   `https://github.com/sdafaff346/ST-Server-Pulse`
+3. 업데이트는 확장 패널의 업데이트 버튼으로 받을 수 있어요.
 
 ## 자동으로 기록하는 것
 - 생성마다: 성공/실패(에러 알림·빈 응답 = 실패, 직접 멈춘 건 제외), 전체 응답 시간, 첫 토큰까지 시간, 연결(소스/모델)
