@@ -20,6 +20,10 @@ const defaultSettings = Object.freeze({
     pingTargets: '',
     probeIntervalMin: 30,
     probeProfileId: '',
+    probeUsePreset: false,
+    probeSystem: '',
+    probeUser: '',
+    probeMaxTokens: 16,
     showBadge: true,
     perConnection: true,
     halfLifeDays: 21,
@@ -428,16 +432,23 @@ async function runPings() {
 // ---------------------------------------------------------------- API probe
 
 let probeRunning = false;
+const DEFAULT_PROBE_SYSTEM = 'This is an automated server health check. Reply with exactly: OK';
+const DEFAULT_PROBE_USER = 'ping';
 
-/** Sends a system + user prompt through a connection profile, or the current connection. */
-async function callLLM(system, user, maxTokens, profileId) {
+/**
+ * Sends ONLY the given system + user messages.
+ * With a profile: the profile's API, model, key and proxy are used; the profile's preset
+ * (prompt order, samplers) and instruct template are skipped unless usePreset is on.
+ * Without a profile: falls back to the current connection via generateRaw (no chat, no character card).
+ */
+async function callLLM(system, user, maxTokens, profileId, usePreset = false) {
     const ctx = SillyTavern.getContext();
     if (profileId && ctx.ConnectionManagerRequestService) {
         const res = await ctx.ConnectionManagerRequestService.sendRequest(
             profileId,
             [{ role: 'system', content: system }, { role: 'user', content: user }],
             maxTokens,
-            { stream: false, extractData: true, includePreset: true, includeInstruct: true },
+            { stream: false, extractData: true, includePreset: !!usePreset, includeInstruct: !!usePreset },
         );
         return typeof res === 'string' ? res : (res?.content ?? '');
     }
@@ -477,10 +488,11 @@ async function runProbe({ manual = false } = {}) {
     let error = '';
     try {
         const text = await callLLM(
-            'This is an automated server health check. Reply with exactly: OK',
-            'ping',
-            64,
+            String(s.probeSystem || '').trim() || DEFAULT_PROBE_SYSTEM,
+            String(s.probeUser || '').trim() || DEFAULT_PROBE_USER,
+            s.probeMaxTokens || 16,
             via ? s.probeProfileId : '',
+            s.probeUsePreset,
         );
         ok = true;
         empty = !String(text || '').trim();
@@ -706,7 +718,15 @@ function createSettingsUI() {
                 <input id="sp_probe_int" class="text_pole" type="number" min="0" max="1440" step="5" />
                 <label for="sp_probe_profile">측정에 쓸 연결</label>
                 <select id="sp_probe_profile" class="text_pole"></select>
-                <small>"OK"만 답하라는 아주 짧은 요청(최대 64토큰)을 보내 실제 응답 시간을 잽니다. 그 사이 실제 생성이 있었으면 건너뛰어 비용을 아껴요. 같은 서버(프록시)의 싼 모델 프로필을 고르면 더 저렴해요.</small>
+                <small>프로필을 고르면 그 프로필의 API·모델·키·프록시로, 아래 프롬프트만 보내요(프리셋·캐릭터·채팅은 안 들어감). 그 사이 실제 생성이 있었으면 측정을 건너뛰어요.</small>
+                <label class="checkbox_label"><input id="sp_probe_preset" type="checkbox" /><span>프로필에 묶인 프리셋 설정(온도 등)도 적용</span></label>
+                <label for="sp_probe_sys">측정용 시스템 프롬프트 (비우면 기본값)</label>
+                <textarea id="sp_probe_sys" class="text_pole" rows="2"></textarea>
+                <label for="sp_probe_user">측정용 유저 메시지 (비우면 기본값)</label>
+                <input id="sp_probe_user" class="text_pole" type="text" />
+                <label for="sp_probe_max">측정 최대 응답 토큰</label>
+                <input id="sp_probe_max" class="text_pole" type="number" min="1" max="4096" step="1" />
+                <small>추론(thinking) 모델은 토큰이 적으면 빈 답이 올 수 있어요. 빈 답도 "서버 응답함"으로 기록돼요.</small>
                 <label for="sp_ping_int">핑 간격(분, 0 = 끔)</label>
                 <input id="sp_ping_int" class="text_pole" type="number" min="0" max="120" step="1" />
                 <label class="checkbox_label"><input id="sp_ping_st" type="checkbox" /><span>SillyTavern 서버 자체도 핑</span></label>
@@ -750,6 +770,14 @@ function createSettingsUI() {
     bindNum('sp_rate_min', 'ratingMinGens', 0, 50);
     bindNum('sp_ping_int', 'pingIntervalMin', 0, 120);
     bindNum('sp_probe_int', 'probeIntervalMin', 0, 1440);
+    bindNum('sp_probe_max', 'probeMaxTokens', 1, 4096);
+    bindCheck('sp_probe_preset', 'probeUsePreset');
+    $('sp_probe_sys').placeholder = DEFAULT_PROBE_SYSTEM;
+    $('sp_probe_sys').value = s.probeSystem;
+    $('sp_probe_sys').addEventListener('input', () => { s.probeSystem = $('sp_probe_sys').value; saveSettingsDebounced(); });
+    $('sp_probe_user').placeholder = DEFAULT_PROBE_USER;
+    $('sp_probe_user').value = s.probeUser;
+    $('sp_probe_user').addEventListener('input', () => { s.probeUser = $('sp_probe_user').value; saveSettingsDebounced(); });
     const sel = $('sp_probe_profile');
     fillProfileSelect(sel, s.probeProfileId);
     sel.addEventListener('focus', () => fillProfileSelect(sel, s.probeProfileId));
@@ -807,7 +835,7 @@ function fillProfileSelect(select, currentId) {
     } catch {
         profiles = []; // Connection Manager disabled
     }
-    select.innerHTML = '<option value="">현재 연결로 측정</option>'
+    select.innerHTML = '<option value="">현재 연결로 측정 (프로필 없음)</option>'
         + profiles.map(p => `<option value="${esc(p.id)}">${esc(p.name)} (프로필)</option>`).join('');
     select.value = profiles.some(p => p.id === currentId) ? currentId : '';
 }
