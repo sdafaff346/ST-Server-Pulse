@@ -98,7 +98,9 @@ function connKey() {
         if (c.mainApi === 'openai') {
             const src = c.chatCompletionSettings?.chat_completion_source || 'cc';
             const model = c.getChatCompletionModel?.() || '';
-            return `${src}/${model}`;
+            // Vertex capacity differs by region (global vs us-central1 ...)
+            const region = src === 'vertexai' ? c.chatCompletionSettings?.vertexai_region : '';
+            return `${src}/${model}${region ? `@${region}` : ''}`;
         }
         if (c.mainApi === 'textgenerationwebui') {
             const type = c.textCompletionSettings?.type || 'tc';
@@ -112,6 +114,47 @@ function connKey() {
     return String(c.mainApi || 'unknown');
 }
 
+// ---------------------------------------------------------------- outcome classification
+
+/**
+ * Sorts an error message into a failure class. Exported for testing.
+ * quota    429 / RESOURCE_EXHAUSTED: shared capacity or quota ran out (Vertex dynamic shared quota)
+ * overload 5xx / UNAVAILABLE / overloaded / deadline: the server could not serve the request
+ * network  could not reach the server
+ * blocked  safety filter or empty candidate: the server worked, the content was refused
+ * config   key, permission, bad request: a settings problem, not server health
+ * other    anything else
+ */
+export function classifyError(text) {
+    const t = String(text || '');
+    if (/\b429\b|RESOURCE_EXHAUSTED|resource (has been )?exhausted|too many requests|rate.?limit|quota/i.test(t)) return 'quota';
+    if (/PROHIBITED_CONTENT|blockReason|blocked due to|\bSAFETY\b|RECITATION|BLOCKLIST|SPII|candidate text empty|returned no candidate|moderation|content (policy|filter)/i.test(t)) return 'blocked';
+    if (/\b(500|502|503|504)\b|UNAVAILABLE|overloaded|INTERNAL|internal (server )?error|DEADLINE_EXCEEDED|timed? ?out|bad gateway|service unavailable|try again later/i.test(t)) return 'overload';
+    if (/failed to fetch|networkerror|network error|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|socket hang up|fetch failed|could not get a reply/i.test(t)) return 'network';
+    if (/\b(400|401|403|404)\b|PERMISSION_DENIED|permission denied|UNAUTHENTICATED|INVALID_ARGUMENT|NOT_FOUND|api key|service account|unauthori[sz]ed|forbidden|billing|not supported|invalid/i.test(t)) return 'config';
+    return 'other';
+}
+
+export const CLASS_LABEL = {
+    ok: '성공', quota: '429 할당량 부족', overload: '서버 과부하(5xx)', network: '연결 끊김',
+    blocked: '안전 필터 차단', config: '설정 오류', empty: '빈 응답', other: '기타 오류',
+};
+
+// How much an outcome says "the server is down". null = says nothing about the server.
+const FAIL_WEIGHT = { ok: 0, blocked: 0, quota: 1, overload: 1, network: 1, other: 0.6, empty: 0.5, config: null };
+
+function outcomeOf(rec) {
+    if (rec.cls) return rec.cls;
+    return rec.ok ? 'ok' : 'other'; // records from older versions
+}
+
+/** Old records have no region suffix; let them count for every region of the same model. */
+export function keyMatch(recKey, key) {
+    if (recKey === key) return true;
+    const base = key.split('@')[0];
+    return !String(recKey).includes('@') && recKey === base;
+}
+
 function hourOf(t) {
     const d = new Date(t);
     return d.getHours() + d.getMinutes() / 60;
@@ -122,122 +165,170 @@ function isWeekend(t) {
     return day === 0 || day === 6;
 }
 
-// ---------------------------------------------------------------- metrics
-
-/**
- * Live metrics for one connection around time `now`. Exported for testing.
- */
-export function metricsSnapshot(d, key, now) {
-    let gens = d.gens.filter(g => g.key === key && !g.stopped && now - g.t <= 30 * MIN && g.t <= now);
-    if (gens.length < 2) {
-        gens = d.gens.filter(g => g.key === key && !g.stopped && now - g.t <= 3 * HOUR && g.t <= now).slice(-5);
-    }
-    const n = gens.length;
-    const fails = gens.filter(g => !g.ok).length;
-    const medMs = median(gens.filter(g => g.ok).map(g => g.ms));
-    const medTtft = median(gens.filter(g => g.ok).map(g => g.ttft));
-    const baseline = median(d.gens.filter(g => g.key === key && g.ok && now - g.t <= 14 * DAY && g.t <= now).map(g => g.ms));
-    const baseCount = d.gens.filter(g => g.key === key && g.ok && now - g.t <= 14 * DAY).length;
-    const latRatio = medMs && baseline && baseCount >= 5 ? medMs / baseline : null;
-
-    const pings = d.pings.filter(p => now - p.t <= 30 * MIN && p.t <= now);
-    const pingFail = pings.length ? pings.filter(p => !p.ok).length / pings.length : null;
-
-    // API probes (tiny real requests) for this connection
-    const allProbes = (d.probes || []).filter(p => p.key === key && p.t <= now);
-    let probes = allProbes.filter(p => now - p.t <= 30 * MIN);
-    if (!probes.length) probes = allProbes.filter(p => now - p.t <= 2 * HOUR).slice(-2);
-    const probeN = probes.length;
-    const probeFail = probeN ? probes.filter(p => !p.ok).length / probeN : null;
-    const probeMs = median(probes.filter(p => p.ok).map(p => p.ms));
-    const probeBase = allProbes.filter(p => p.ok && now - p.t <= 14 * DAY);
-    const probeLat = probeMs && probeBase.length >= 5 ? probeMs / median(probeBase.map(p => p.ms)) : null;
-
-    return {
-        n, failRate: n ? fails / n : null, medMs, medTtft,
-        latRatio: latRatio ?? probeLat, pingFail, probeN, probeFail, probeMs,
-    };
-}
-
-function features(s) {
-    return [
-        1,
-        s.failRate ?? 0,
-        s.latRatio ? clamp(Math.log2(s.latRatio), -2, 3) : 0,
-        s.pingFail ?? 0,
-        s.probeFail ?? 0,
-    ];
-}
-
-function heuristicScore(s) {
-    let score = 4.3;
-    if (s.failRate != null) score -= 3.2 * s.failRate;
-    if (s.latRatio) score -= 0.9 * Math.max(0, Math.log2(s.latRatio)) - 0.3 * Math.max(0, -Math.log2(s.latRatio));
-    if (s.pingFail != null) score -= 2 * s.pingFail;
-    if (s.probeFail != null) score -= 2.8 * s.probeFail;
-    return clamp(score, 1, 5);
-}
-
-// Weighted ridge regression: rating ~ features(snapshot)
-function fitRidge(rows, lambda = 1) {
-    const k = rows[0].x.length;
-    const A = Array.from({ length: k }, () => new Array(k).fill(0));
-    const b = new Array(k).fill(0);
-    for (const { x, y, w } of rows) {
-        for (let i = 0; i < k; i++) {
-            b[i] += w * x[i] * y;
-            for (let j = 0; j < k; j++) A[i][j] += w * x[i] * x[j];
-        }
-    }
-    for (let i = 1; i < k; i++) A[i][i] += lambda;
-    A[0][0] += 1e-6;
-    // Gaussian elimination
-    const M = A.map((row, i) => [...row, b[i]]);
-    for (let c = 0; c < k; c++) {
-        let p = c;
-        for (let r = c + 1; r < k; r++) if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r;
-        [M[c], M[p]] = [M[p], M[c]];
-        if (Math.abs(M[c][c]) < 1e-12) return null;
-        for (let r = 0; r < k; r++) {
-            if (r === c) continue;
-            const f = M[r][c] / M[c][c];
-            for (let j = c; j <= k; j++) M[r][j] -= f * M[c][j];
-        }
-    }
-    return M.map((row, i) => row[k] / row[i]);
-}
-
 function decay(age, halfLifeDays) {
     return Math.pow(0.5, Math.max(0, age) / (halfLifeDays * DAY));
 }
 
+function hourKernel(t1, t2) {
+    let dh = Math.abs(hourOf(t1) - hourOf(t2));
+    dh = Math.min(dh, 24 - dh);
+    return Math.exp(-(dh * dh) / (2 * 1.5 * 1.5)) * (isWeekend(t1) === isWeekend(t2) ? 1 : 0.5);
+}
+
 /**
- * Rating expected at time `t` from past ratings at similar hours. Exported for testing.
+ * Generations and probes for one connection as server-health events.
+ * Bursts (retry spam after a 429) are down-weighted so one bad minute does not dominate.
+ * Exported for testing.
  */
-export function timePrior(ratings, t, now, halfLifeDays) {
-    if (!ratings.length) return { mean: null, neff: 0 };
-    const h = hourOf(t);
-    const we = isWeekend(t);
-    const global = ratings.reduce((s, r) => s + r.score, 0) / ratings.length;
-    let sw = 0;
-    let sws = 0;
-    for (const r of ratings) {
-        let dh = Math.abs(hourOf(r.t) - h);
-        dh = Math.min(dh, 24 - dh);
-        const w = decay(now - r.t, halfLifeDays) * Math.exp(-(dh * dh) / (2 * 1.5 * 1.5)) * (isWeekend(r.t) === we ? 1 : 0.5);
-        sw += w;
-        sws += w * r.score;
+export function serverEvents(d, key, now) {
+    const raw = [];
+    for (const g of d.gens) {
+        if (g.stopped || g.t > now || !keyMatch(g.key, key)) continue;
+        const cls = outcomeOf(g);
+        const fail = FAIL_WEIGHT[cls];
+        if (fail == null) continue;
+        raw.push({ t: g.t, fail, cls, ms: cls === 'ok' ? g.ms : null, src: 'gen' });
     }
-    const k = 1.5; // shrink toward the overall average when data is thin
-    return { mean: (sws + k * global) / (sw + k), neff: sw };
+    for (const p of d.probes || []) {
+        if (p.t > now || !keyMatch(p.key, key)) continue;
+        const cls = p.cls || (p.ok ? 'ok' : 'other');
+        const fail = FAIL_WEIGHT[cls];
+        if (fail == null) continue;
+        raw.push({ t: p.t, fail, cls, ms: null, src: 'probe' });
+    }
+    raw.sort((x, y) => x.t - y.t);
+    // burst weight: 1 / sqrt(events within +-5 minutes)
+    let lo = 0;
+    let hi = 0;
+    for (let i = 0; i < raw.length; i++) {
+        while (raw[lo].t < raw[i].t - 5 * MIN) lo++;
+        while (hi + 1 < raw.length && raw[hi + 1].t <= raw[i].t + 5 * MIN) hi++;
+        raw[i].bw = 1 / Math.sqrt(hi - lo + 1);
+    }
+    return raw;
+}
+
+/**
+ * Chance that a request at time `t` fails, learned from past events at similar hours.
+ * Beta-smoothed toward this connection's overall failure rate. Exported for testing.
+ */
+export function hourlyFailure(events, t, now, halfLifeDays) {
+    if (!events.length) return { p: null, neff: 0, quota: 0, overload: 0 };
+    let all = 0;
+    let allW = 0;
+    for (const e of events) {
+        const w = decay(now - e.t, halfLifeDays) * e.bw;
+        all += w * e.fail;
+        allW += w;
+    }
+    const base = allW ? all / allW : 0.1;
+    let sw = 0;
+    let sf = 0;
+    let sq = 0;
+    let so = 0;
+    for (const e of events) {
+        const w = decay(now - e.t, halfLifeDays) * hourKernel(e.t, t) * e.bw;
+        sw += w;
+        sf += w * e.fail;
+        if (e.cls === 'quota') sq += w;
+        if (e.cls === 'overload' || e.cls === 'network') so += w;
+    }
+    const k = 2; // prior strength
+    return {
+        p: (sf + k * base) / (sw + k),
+        neff: sw,
+        quota: sw ? sq / sw : 0,
+        overload: sw ? so / sw : 0,
+    };
+}
+
+/** What is happening right now: events of the last ~20 minutes, newest weigh most. */
+export function liveState(events, now) {
+    let sw = 0;
+    let sf = 0;
+    let n = 0;
+    let lastFail = null;
+    const recent = [];
+    for (const e of events) {
+        const age = now - e.t;
+        if (age < 0 || age > 20 * MIN) continue;
+        const w = Math.pow(0.5, age / (8 * MIN));
+        sw += w;
+        sf += w * e.fail;
+        n++;
+        recent.push(e);
+        if (e.fail >= 1) lastFail = e;
+    }
+    return { sw, sf, n, recent, lastFail };
+}
+
+/** Typical minutes from a quota/overload failure until the next success. */
+export function recoveryMinutes(events, cls) {
+    const gaps = [];
+    for (let i = 0; i < events.length; i++) {
+        if (events[i].cls !== cls) continue;
+        if (i > 0 && events[i - 1].cls === cls && events[i].t - events[i - 1].t < 10 * MIN) continue; // count each streak once
+        const next = events.slice(i + 1).find(e => e.cls === 'ok');
+        if (next && next.t - events[i].t < 3 * HOUR) gaps.push((next.t - events[i].t) / MIN);
+    }
+    return gaps.length >= 3 ? median(gaps) : null;
+}
+
+function latencyRatio(d, key, now) {
+    const ok = d.gens.filter(g => keyMatch(g.key, key) && !g.stopped && outcomeOf(g) === 'ok' && g.t <= now);
+    const base = median(ok.filter(g => now - g.t <= 14 * DAY).map(g => g.ms));
+    const recent = ok.filter(g => now - g.t <= 30 * MIN).slice(-5);
+    const med = median(recent.map(g => g.ms));
+    return ok.length >= 6 && med && base ? { ratio: med / base, ms: med } : { ratio: null, ms: med };
+}
+
+/** 1-5 score from success chance and slowness. */
+export function scoreFrom(success, latRatio) {
+    let sc = 1 + 4 * success;
+    if (latRatio) sc -= 0.8 * clamp(Math.log2(latRatio), 0, 2);
+    return clamp(sc, 1, 5);
+}
+
+/**
+ * Live metrics snapshot stored with each rating (kept for the dashboard and calibration).
+ * Exported for testing.
+ */
+export function metricsSnapshot(d, key, now) {
+    const ev = serverEvents(d, key, now);
+    const live = liveState(ev, now);
+    const hour = hourlyFailure(ev, now, now, 21);
+    const lat = latencyRatio(d, key, now);
+    const pFail = live.sw ? (live.sf + 1.5 * (hour.p ?? 0.1)) / (live.sw + 1.5) : hour.p;
+    return {
+        n: live.n,
+        failRate: live.sw ? live.sf / live.sw : null,
+        latRatio: lat.ratio,
+        auto: pFail == null ? null : scoreFrom(1 - pFail, lat.ratio),
+    };
 }
 
 function scopedRatings(d, key, settings) {
     if (settings.perConnection) {
-        const own = d.ratings.filter(r => r.key === key);
+        const own = d.ratings.filter(r => keyMatch(r.key, key));
         if (own.length >= 5) return { list: own, scoped: true };
     }
     return { list: d.ratings, scoped: false };
+}
+
+/** Learns how the user's ratings relate to the automatic score: rating ~ a + b * auto. */
+export function fitCalibration(ratings, now, halfLifeDays) {
+    const rows = ratings
+        .map(r => ({ x: r.snap?.auto ?? (r.snap?.failRate != null ? scoreFrom(1 - r.snap.failRate, r.snap.latRatio) : null), y: r.score, w: decay(now - r.t, halfLifeDays) }))
+        .filter(r => r.x != null);
+    if (rows.length < 6) return null;
+    let sw = 0, sx = 0, sy = 0;
+    for (const r of rows) { sw += r.w; sx += r.w * r.x; sy += r.w * r.y; }
+    const mx = sx / sw;
+    const my = sy / sw;
+    let sxx = 0, sxy = 0;
+    for (const r of rows) { sxx += r.w * (r.x - mx) ** 2; sxy += r.w * (r.x - mx) * (r.y - my); }
+    const b = clamp(sxx > 1e-6 ? sxy / sxx : 1, 0.3, 1.5);
+    return { a: my - b * mx, b, n: rows.length };
 }
 
 export function labelFor(score) {
@@ -251,42 +342,26 @@ export function labelFor(score) {
 
 /**
  * Full prediction for connection `key` at time `now`. Exported for testing.
+ * Works from generation/probe outcomes alone; the user's ratings only calibrate it.
  */
 export function predict(d, settings, key, now) {
-    const { list: ratings, scoped } = scopedRatings(d, key, settings);
-    const snap = metricsSnapshot(d, key, now);
-    const prior = timePrior(ratings, now, now, settings.halfLifeDays);
+    const hl = settings.halfLifeDays || 21;
+    const ev = serverEvents(d, key, now);
+    const live = liveState(ev, now);
+    const hour = hourlyFailure(ev, now, now, hl);
+    const lat = latencyRatio(d, key, now);
     const reasons = [];
 
-    // Metric model: learned from the user's ratings once there are enough, else a heuristic
-    const rows = ratings
-        .filter(r => r.snap && r.snap.n > 0)
-        .map(r => ({ x: features(r.snap), y: r.score, w: decay(now - r.t, settings.halfLifeDays) }));
-    const beta = rows.length >= 6 ? fitRidge(rows) : null;
-    const hasLive = snap.n > 0 || snap.pingFail != null || snap.probeFail != null;
-    let metricScore = null;
-    if (hasLive) {
-        const x = features(snap);
-        const heur = heuristicScore(snap);
-        if (beta) {
-            // Trust the learned model more as ratings accumulate, but never fully (it can extrapolate badly)
-            const reg = clamp(x.reduce((s, xi, i) => s + xi * beta[i], 0), 1, 5);
-            const wReg = Math.min(0.7, rows.length / 40);
-            metricScore = wReg * reg + (1 - wReg) * heur;
-        } else {
-            metricScore = heur;
-        }
-        // Many failures right now: never report better than the rule-based score
-        if ((snap.failRate ?? 0) >= 0.5 || (snap.probeFail ?? 0) >= 0.5) metricScore = Math.min(metricScore, heur);
-    }
+    // Chance of failure now: recent events first, this hour's history as the prior
+    let pFail = null;
+    if (live.sw) pFail = (live.sf + 1.5 * (hour.p ?? 0.1)) / (live.sw + 1.5);
+    else if (hour.p != null) pFail = hour.p;
+    const success = pFail == null ? null : 1 - pFail;
 
-    let score = null;
-    if (metricScore != null && prior.mean != null) {
-        const wPrior = clamp(prior.neff / (prior.neff + 3), 0.15, 0.5);
-        score = (1 - wPrior) * metricScore + wPrior * prior.mean;
-    } else {
-        score = metricScore ?? prior.mean;
-    }
+    let score = success == null ? null : scoreFrom(success, lat.ratio);
+    const { list: ratings, scoped } = scopedRatings(d, key, settings);
+    const cal = fitCalibration(ratings, now, hl);
+    if (score != null && cal) score = clamp(cal.a + cal.b * score, 1, 5);
 
     // A rating the user just gave outweighs everything for a while
     const last = ratings.filter(r => r.t <= now).at(-1);
@@ -296,28 +371,44 @@ export function predict(d, settings, key, now) {
         reasons.push(`${Math.round((now - last.t) / MIN)}분 전 내 평가 ${last.score}점 반영`);
     }
 
-    if (snap.n) {
-        reasons.push(`최근 생성 ${snap.n}회 중 실패 ${Math.round((snap.failRate || 0) * snap.n)}회`);
-        if (snap.medMs) reasons.push(`응답 ${fmtMs(snap.medMs)}${snap.latRatio ? ` (평소의 ${snap.latRatio.toFixed(1)}배)` : ''}`);
+    if (live.n) {
+        const counts = {};
+        for (const e of live.recent) counts[e.cls] = (counts[e.cls] || 0) + 1;
+        const parts = Object.entries(counts).map(([c, n]) => `${CLASS_LABEL[c] || c} ${n}`);
+        reasons.push(`최근 20분: ${parts.join(', ')}`);
     }
-    if (snap.probeN) reasons.push(`API 측정 ${snap.probeN}회 중 실패 ${Math.round((snap.probeFail || 0) * snap.probeN)}회${snap.probeMs ? `, 응답 ${fmtMs(snap.probeMs)}` : ''}${!snap.n && snap.latRatio ? ` (평소의 ${snap.latRatio.toFixed(1)}배)` : ''}`);
-    if (snap.pingFail != null) reasons.push(`핑 실패율 ${Math.round(snap.pingFail * 100)}%`);
-    if (prior.mean != null && prior.neff >= 0.5) reasons.push(`이 시간대 평소 평가 ${prior.mean.toFixed(1)}점`);
-    if (beta) reasons.push(`내 평가 ${rows.length}개로 학습된 모델 사용`);
+    if (lat.ms && lat.ratio) reasons.push(`응답 ${fmtMs(lat.ms)} (평소의 ${lat.ratio.toFixed(1)}배)`);
+    if (hour.neff >= 0.5) {
+        const why = hour.quota >= 0.15 ? ' · 이 시간엔 429가 잦아요' : hour.overload >= 0.15 ? ' · 이 시간엔 과부하가 잦아요' : '';
+        reasons.push(`이 시간대 평소 성공률 ${Math.round((1 - hour.p) * 100)}% (기록 ${Math.round(hour.neff * 10) / 10}건 분량)${why}`);
+    }
+    if (cal) reasons.push(`내 평가 ${cal.n}개로 점수 보정 중`);
 
-    const neff = prior.neff + (snap.n ? Math.min(snap.n, 5) : 0) + (snap.probeN ? Math.min(snap.probeN, 2) : 0) + (beta ? 2 : 0);
-    const confidence = score == null ? '없음' : neff >= 8 ? '높음' : neff >= 3 ? '보통' : '낮음';
+    let recovery = null;
+    if (live.lastFail && now - live.lastFail.t < 15 * MIN && (live.lastFail.cls === 'quota' || live.lastFail.cls === 'overload')) {
+        const m = recoveryMinutes(ev, live.lastFail.cls);
+        recovery = { cls: live.lastFail.cls, minutes: m };
+        reasons.push(m != null ? `${CLASS_LABEL[live.lastFail.cls]}: 보통 ${Math.max(1, Math.round(m))}분 뒤 회복돼요` : `${CLASS_LABEL[live.lastFail.cls]} 발생 중`);
+    }
+
+    const evidence = hour.neff + Math.min(live.n, 4) + (cal ? 2 : 0);
+    const confidence = score == null ? '없음' : evidence >= 8 ? '높음' : evidence >= 3 ? '보통' : '낮음';
 
     const forecast = [];
     const startHour = new Date(now);
     startHour.setMinutes(0, 0, 0);
     for (let i = 1; i <= 24; i++) {
         const t = startHour.getTime() + i * HOUR;
-        const p = timePrior(ratings, t, now, settings.halfLifeDays);
-        forecast.push({ t, score: p.neff >= 0.3 ? p.mean : null, neff: p.neff });
+        const h = hourlyFailure(ev, t, now, hl);
+        let sc = h.p == null || h.neff < 0.3 ? null : scoreFrom(1 - h.p, null);
+        if (sc != null && cal) sc = clamp(cal.a + cal.b * sc, 1, 5);
+        forecast.push({ t, success: h.p == null || h.neff < 0.3 ? null : 1 - h.p, score: sc, neff: h.neff, quota: h.quota, overload: h.overload });
     }
 
-    return { score, label: labelFor(score), confidence, reasons, forecast, snap, scoped, ratingsUsed: ratings.length };
+    return {
+        score, success, label: labelFor(score), confidence, reasons, forecast, recovery,
+        scoped, ratingsUsed: ratings.length, events: ev.length,
+    };
 }
 
 // ---------------------------------------------------------------- generation tracking
@@ -328,7 +419,7 @@ function onGenStarted(type, _params, dryRun) {
     if (dryRun || SKIP_TYPES.has(type) || !getSettings().enabled) return;
     // A previous generation that never reported its end gets closed here
     if (pending) finalize();
-    pending = { t: Date.now(), t0: performance.now(), key: connKey(), type, ttft: null, got: false, empty: false, error: false, stopped: false };
+    pending = { t: Date.now(), t0: performance.now(), key: connKey(), type, ttft: null, got: false, empty: false, error: false, errText: '', stopped: false };
 }
 
 function onToken() {
@@ -352,35 +443,51 @@ function onGenEnded() {
     setTimeout(() => finalize(), 400);
 }
 
-function finalize(forceOk) {
+function finalize() {
     const p = pending;
     if (!p) return;
     pending = null;
-    const ok = forceOk ?? (p.got && !p.empty && !p.error);
+    let cls;
+    if (p.stopped) cls = 'ok';
+    else if (p.error) cls = classifyError(p.errText);
+    else if (!p.got || p.empty) cls = isGeminiKey(p.key) ? 'blocked' : 'empty'; // Gemini returns silent empty replies when its filter cuts in
+    else cls = 'ok';
     data.gens.push({
-        t: p.t, key: p.key, type: p.type, ok: p.stopped ? true : ok, stopped: p.stopped,
+        t: p.t, key: p.key, type: p.type, ok: cls === 'ok', cls, stopped: p.stopped,
+        err: p.errText ? p.errText.slice(0, 160) : undefined,
         ms: Math.round(performance.now() - p.t0), ttft: p.ttft != null ? Math.round(p.ttft) : null,
     });
     saveData();
     refreshBadge();
 }
 
+function isGeminiKey(key) {
+    return /^(vertexai|makersuite)\//.test(String(key)) || /gemini/i.test(String(key));
+}
+
 // Error toasts during a generation count as failures (watch the toast container, do not patch toastr)
 let toastObs = null;
 let watchedContainer = null;
+const seenToasts = new WeakSet();
+
+function noteToast(n) {
+    if (!pending || !(n instanceof HTMLElement) || seenToasts.has(n)) return;
+    seenToasts.add(n);
+    if (!n.classList.contains('toast-error')) return;
+    pending.error = true;
+    if (!pending.errText) pending.errText = (n.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 400);
+}
+
 function watchToasts() {
     const attach = () => {
         const c = document.getElementById('toast-container');
         if (!c || c === watchedContainer) return;
         watchedContainer = c;
         toastObs?.disconnect();
+        // toastr creates the container together with its first toast, so read what is already inside
+        for (const n of c.children) noteToast(n);
         toastObs = new MutationObserver(muts => {
-            if (!pending) return;
-            for (const m of muts) {
-                for (const n of m.addedNodes) {
-                    if (n instanceof HTMLElement && n.classList.contains('toast-error')) pending.error = true;
-                }
-            }
+            for (const m of muts) for (const n of m.addedNodes) noteToast(n);
         });
         toastObs.observe(c, { childList: true });
     };
@@ -487,6 +594,7 @@ async function runProbe({ manual = false } = {}) {
     let ok = false;
     let empty = false;
     let error = '';
+    let cls = 'ok';
     try {
         const text = await callLLM(
             String(s.probeSystem || '').trim() || DEFAULT_PROBE_SYSTEM,
@@ -505,17 +613,20 @@ async function runProbe({ manual = false } = {}) {
             empty = true;
         } else {
             error = msg.slice(0, 200);
+            cls = classifyError(msg);
+            // A filtered reply still proves the server is up
+            if (cls === 'blocked') ok = true;
         }
     } finally {
         probeRunning = false;
     }
-    const rec = { t: now, key, ok, ms: Math.round(performance.now() - t0), empty, via, error };
+    const rec = { t: now, key, ok, cls, ms: Math.round(performance.now() - t0), empty, via, error };
     data.probes.push(rec);
     saveData();
     refreshBadge();
     if (manual) {
         if (ok) toastr.success(`API 응답 ${fmtMs(rec.ms)}${via ? ` (${via} 경유)` : ''}`, 'Server Pulse');
-        else toastr.error(error || '응답 없음', 'API 측정 실패');
+        else toastr.error(`${CLASS_LABEL[cls] || ''}: ${error || '응답 없음'}`, 'API 측정 실패');
     }
     return rec;
 }
@@ -604,8 +715,8 @@ function refreshBadge() {
     if (el.parentElement !== document.body || document.body.lastElementChild !== el) document.body.appendChild(el);
     const p = predict(data, s, connKey(), Date.now());
     el.className = `sp-badge sp-pos-${s.badgePos || 'top-right'} ${p.label.cls}`;
-    el.innerHTML = `<span class="sp-dot"></span>${p.score == null ? '?' : p.score.toFixed(1)}`;
-    el.title = `서버 상태: ${p.label.text} (신뢰도 ${p.confidence})\n${p.reasons.join('\n')}\n클릭하면 자세히`;
+    el.innerHTML = `<span class="sp-dot"></span>${p.success == null ? (p.score == null ? '?' : p.score.toFixed(1)) : `${Math.round(p.success * 100)}%`}`;
+    el.title = `지금 보내면 성공할 가능성 ${p.success == null ? '-' : `${Math.round(p.success * 100)}%`} · ${p.label.text} (신뢰도 ${p.confidence})\n${p.reasons.join('\n')}\n클릭하면 자세히`;
 }
 
 function statsTable(now) {
@@ -616,10 +727,20 @@ function statsTable(now) {
     }
     if (!byKey.size) return '<p class="sp-muted">최근 24시간 생성 기록이 없어요.</p>';
     const rows = [...byKey].map(([k, gs]) => {
-        const ok = gs.filter(g => g.ok);
-        return `<tr><td>${esc(k)}</td><td>${gs.length}</td><td>${Math.round(ok.length / gs.length * 100)}%</td><td>${fmtMs(median(ok.map(g => g.ms)))}</td><td>${fmtMs(median(ok.map(g => g.ttft)))}</td></tr>`;
+        const c = cls => gs.filter(g => outcomeOf(g) === cls).length;
+        const ok = gs.filter(g => outcomeOf(g) === 'ok');
+        const counted = gs.filter(g => FAIL_WEIGHT[outcomeOf(g)] != null);
+        const rate = counted.length ? Math.round((1 - counted.reduce((x, g) => x + FAIL_WEIGHT[outcomeOf(g)], 0) / counted.length) * 100) : '-';
+        return `<tr><td>${esc(k)}</td><td>${gs.length}</td><td>${rate}%</td><td>${c('quota')}</td><td>${c('overload') + c('network')}</td><td>${c('blocked')}</td><td>${fmtMs(median(ok.map(g => g.ms)))}</td></tr>`;
     }).join('');
-    return `<table class="sp-table"><tr><th>연결</th><th>생성</th><th>성공률</th><th>응답(중앙값)</th><th>첫 토큰</th></tr>${rows}</table>`;
+    return `<table class="sp-table"><tr><th>연결</th><th>생성</th><th>서버 성공률</th><th>429</th><th>5xx·끊김</th><th>차단</th><th>응답</th></tr>${rows}</table>
+        <p class="sp-muted">안전 필터 차단은 서버는 정상 응답한 것이라 성공률 계산에서 실패로 치지 않아요.</p>`;
+}
+
+function recentFailures(now) {
+    const fails = data.gens.filter(g => now - g.t <= DAY && !g.stopped && !['ok'].includes(outcomeOf(g))).slice(-6).reverse();
+    if (!fails.length) return '';
+    return `<ul class="sp-fails">${fails.map(g => `<li><span class="sp-fail-tag sp-f-${outcomeOf(g)}">${esc(CLASS_LABEL[outcomeOf(g)] || outcomeOf(g))}</span> ${new Date(g.t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}${g.err ? ` <small>${esc(g.err)}</small>` : ''}</li>`).join('')}</ul>`;
 }
 
 function pingTable(now) {
@@ -657,33 +778,35 @@ function forecastHtml(p) {
     const bars = p.forecast.map(f => {
         const h = new Date(f.t).getHours();
         const lab = labelFor(f.score);
-        const height = f.score == null ? 6 : Math.round((f.score / 5) * 100);
-        return `<div class="sp-bar-col" title="${h}시: ${f.score == null ? '데이터 없음' : `${f.score.toFixed(1)}점 ${lab.text}`}">
+        const height = f.success == null ? 6 : Math.max(4, Math.round(f.success * 100));
+        const why = f.quota >= 0.15 ? ' · 429 잦음' : f.overload >= 0.15 ? ' · 과부하 잦음' : '';
+        return `<div class="sp-bar-col" title="${h}시: ${f.success == null ? '기록 없음' : `성공 ${Math.round(f.success * 100)}%${why}`}">
             <div class="sp-bar ${lab.cls}" style="height:${height}%"></div><div class="sp-bar-h">${h % 3 === 0 ? h : ''}</div></div>`;
     }).join('');
-    const known = p.forecast.filter(f => f.score != null && f.neff >= 1);
-    let tip = '평가가 더 쌓이면 시간대별 예측이 나와요.';
+    const known = p.forecast.filter(f => f.success != null && f.neff >= 1);
+    let tip = '생성하거나 API 측정이 쌓이면 시간대별 예측이 나와요. 별점은 없어도 돼요.';
     if (known.length >= 3) {
-        const best = [...known].sort((a, b) => b.score - a.score).slice(0, 3).map(f => `${new Date(f.t).getHours()}시`);
-        const worst = [...known].sort((a, b) => a.score - b.score)[0];
-        tip = `좋을 것 같은 시간: <b>${best.join(', ')}</b>${worst.score < 2.8 ? ` · 피하면 좋은 시간: <b>${new Date(worst.t).getHours()}시</b>` : ''}`;
+        const best = [...known].sort((a, b) => b.success - a.success).slice(0, 3).map(f => `${new Date(f.t).getHours()}시`);
+        const worst = [...known].sort((a, b) => a.success - b.success)[0];
+        const worstWhy = worst.quota >= 0.15 ? '429' : worst.overload >= 0.15 ? '과부하' : '실패';
+        tip = `잘 될 것 같은 시간: <b>${best.join(', ')}</b>${worst.success < 0.8 ? ` · 피하면 좋은 시간: <b>${new Date(worst.t).getHours()}시</b> (${worstWhy} ${Math.round((1 - worst.success) * 100)}%)` : ''}`;
     }
     return `<div class="sp-forecast">${bars}</div><div class="sp-tip">${tip}</div>`;
 }
 
-function heatmapHtml(now, s) {
-    const cells = Array.from({ length: 7 }, () => Array.from({ length: 24 }, () => ({ sw: 0, sws: 0 })));
-    for (const r of data.ratings) {
-        const d = new Date(r.t);
-        const w = decay(now - r.t, s.halfLifeDays);
+function heatmapHtml(now, s, key) {
+    const cells = Array.from({ length: 7 }, () => Array.from({ length: 24 }, () => ({ sw: 0, sf: 0 })));
+    for (const e of serverEvents(data, key, now)) {
+        const d = new Date(e.t);
+        const w = decay(now - e.t, s.halfLifeDays || 21) * e.bw;
         const c = cells[d.getDay()][d.getHours()];
         c.sw += w;
-        c.sws += w * r.score;
+        c.sf += w * e.fail;
     }
     const days = ['일', '월', '화', '수', '목', '금', '토'];
     const rows = cells.map((row, di) => `<div class="sp-hm-row"><span class="sp-hm-day">${days[di]}</span>${row.map((c, h) => {
-        const v = c.sw ? c.sws / c.sw : null;
-        return `<span class="sp-hm-cell ${labelFor(v).cls}" title="${days[di]} ${h}시: ${v == null ? '-' : v.toFixed(1)}"></span>`;
+        const succ = c.sw ? 1 - c.sf / c.sw : null;
+        return `<span class="sp-hm-cell ${labelFor(succ == null ? null : scoreFrom(succ, null)).cls}" title="${days[di]} ${h}시: ${succ == null ? '-' : `성공 ${Math.round(succ * 100)}%`}"></span>`;
     }).join('')}</div>`).join('');
     return `<div class="sp-heatmap">${rows}<div class="sp-hm-row"><span class="sp-hm-day"></span>${Array.from({ length: 24 }, (_, h) => `<span class="sp-hm-lab">${h % 6 === 0 ? h : ''}</span>`).join('')}</div></div>`;
 }
@@ -749,22 +872,23 @@ async function renderDashboard() {
     <div class="sp-dash">
         <h3>서버 상태 예측</h3>
         <div class="sp-now ${p.label.cls}">
-            <div class="sp-now-score">${p.score == null ? '?' : p.score.toFixed(1)}<small>/5</small></div>
-            <div><b>${p.label.text}</b><br><small>신뢰도 ${p.confidence} · ${esc(key)}</small></div>
+            <div class="sp-now-score">${p.success == null ? '?' : Math.round(p.success * 100)}<small>%</small></div>
+            <div><b>지금 보내면 성공할 가능성</b> · ${p.label.text}${p.score == null ? '' : ` (${p.score.toFixed(1)}/5)`}<br><small>신뢰도 ${p.confidence} · ${esc(key)}</small></div>
         </div>
-        <ul class="sp-reasons">${p.reasons.map(r => `<li>${esc(r)}</li>`).join('') || '<li>아직 데이터가 없어요. 몇 번 생성하고 평가해 주세요.</li>'}</ul>
+        <ul class="sp-reasons">${p.reasons.map(r => `<li>${esc(r)}</li>`).join('') || '<li>아직 데이터가 없어요. 몇 번 생성하면 바로 예측이 시작돼요.</li>'}</ul>
         <div class="sp-section">지금 평가하기 <div class="sp-stars">${starsHtml()}</div></div>
-        <h4>앞으로 24시간 예측</h4>
+        <h4>앞으로 24시간 성공 가능성</h4>
         ${forecastHtml(p)}
-        <h4>요일·시간별 내 평가</h4>
-        ${heatmapHtml(now, s)}
+        <h4>요일·시간별 성공률</h4>
+        ${heatmapHtml(now, s, key)}
         <h4>최근 24시간 생성</h4>
         ${statsTable(now)}
+        ${recentFailures(now)}
         <h4>API 직접 측정 (24시간) <span class="menu_button sp-probe-btn" title="작은 요청을 한 번 보내 응답 시간을 잽니다">지금 측정</span></h4>
         ${probeTable(now)}
         <h4>핑</h4>
         ${pingTable(now)}
-        <p class="sp-muted">평가 ${data.ratings.length}개 · 생성 기록 ${data.gens.length}개 · API 측정 ${data.probes.length}개 · 핑 ${data.pings.length}개${p.scoped ? ' · 이 연결의 평가만 사용 중' : ''}</p>
+        <p class="sp-muted">예측 근거 ${p.events}건 · 평가 ${data.ratings.length}개 · 생성 기록 ${data.gens.length}개 · API 측정 ${data.probes.length}개 · 핑 ${data.pings.length}개${p.scoped ? ' · 이 연결의 평가만 사용 중' : ''}</p>
     </div>`;
     const { Popup, POPUP_TYPE } = SillyTavern.getContext();
     await new Popup(html, POPUP_TYPE.TEXT, '', { wide: true, allowVerticalScrolling: true, okButton: '닫기' }).show();
