@@ -549,6 +549,22 @@ const DEFAULT_PROBE_USER = 'ping';
  * (prompt order, samplers) and instruct template are skipped unless usePreset is on.
  * Without a profile: falls back to the current connection via generateRaw (no chat, no character card).
  */
+/**
+ * Without a preset, SillyTavern does not send Vertex AI's auth mode with profile requests, so the
+ * server falls back to Express (API key) mode and Google rejects service-account setups with
+ * "API keys are not supported by this API". Fill those fields from the current settings.
+ */
+function profileOverrides(profileId) {
+    const ctx = SillyTavern.getContext();
+    const cc = ctx.chatCompletionSettings || {};
+    const out = {};
+    if (cc.vertexai_auth_mode) out.vertexai_auth_mode = cc.vertexai_auth_mode;
+    if (cc.vertexai_express_project_id) out.vertexai_express_project_id = cc.vertexai_express_project_id;
+    const profile = ctx.extensionSettings.connectionManager?.profiles?.find(p => p.id === profileId);
+    if (profile && !profile['api-url'] && cc.vertexai_region) out.vertexai_region = cc.vertexai_region;
+    return out;
+}
+
 async function callLLM(system, user, maxTokens, profileId, usePreset = false) {
     const ctx = SillyTavern.getContext();
     if (profileId && ctx.ConnectionManagerRequestService) {
@@ -557,6 +573,7 @@ async function callLLM(system, user, maxTokens, profileId, usePreset = false) {
             [{ role: 'system', content: system }, { role: 'user', content: user }],
             maxTokens,
             { stream: false, extractData: true, includePreset: !!usePreset, includeInstruct: !!usePreset },
+            profileOverrides(profileId),
         );
         return typeof res === 'string' ? res : (res?.content ?? '');
     }
