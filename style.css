@@ -38,10 +38,29 @@ body:has(#top-settings-holder .drawer-content.openDrawer) #sp_badge { display: n
 
 /* rating prompt */
 .sp-prompt small { opacity: 0.7; }
-.sp-stars { display: flex; gap: 4px; margin: 6px 0 2px; flex-wrap: wrap; }
-.sp-rate-btn.menu_button { min-width: 34px; padding: 3px 8px; margin: 0; justify-content: center; }
-.sp-legend { font-size: 0.8em; opacity: 0.75; }
+.sp-rates { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; margin: 6px 0 4px; }
+.sp-section .sp-rates { grid-template-columns: repeat(4, minmax(0, 1fr)); max-width: 460px; }
+.sp-rate-btn.menu_button { display: flex; align-items: center; justify-content: center; gap: 5px; margin: 0; padding: 5px 8px; white-space: nowrap; border-left: 3px solid var(--sp-rc, transparent); }
+.sp-r-emoji { font-size: 1.1em; line-height: 1; }
+.sp-r-noreply { --sp-rc: #8a8f99; }
+.sp-r-broken { --sp-rc: #d94040; }
+.sp-r-dull { --sp-rc: #e0b53a; }
+.sp-r-good { --sp-rc: #2fae5f; }
+.sp-legend { font-size: 0.78em; opacity: 0.75; line-height: 1.4; }
 .sp-skip.menu_button { margin: 6px 0 0; padding: 2px 8px; font-size: 0.85em; width: fit-content; }
+@media (max-width: 500px) { .sp-section .sp-rates { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+
+/* reply quality */
+.sp-mood { margin-left: 2px; line-height: 1; }
+.sp-qbar { display: flex; height: 6px; border-radius: 3px; overflow: hidden; margin-top: 3px; gap: 1px; }
+.sp-qbar-big { height: 22px; border-radius: 6px; font-size: 0.78em; }
+.sp-qbar > span { display: flex; align-items: center; justify-content: center; min-width: 0; overflow: hidden; white-space: nowrap; color: #fff; }
+.sp-q-broken { background: #d94040; }
+.sp-q-dull { background: #c9a227; }
+.sp-q-good { background: #2fae5f; }
+.sp-qnow { margin-top: 8px; }
+.sp-qnow small { display: block; margin-top: 3px; }
+.sp-bar-mood { text-align: center; font-size: 0.7em; line-height: 1; margin-bottom: 1px; }
 
 /* dashboard */
 .sp-dash { text-align: left; }
@@ -87,3 +106,5 @@ body:has(#top-settings-holder .drawer-content.openDrawer) #sp_badge { display: n
 .sp-f-overload, .sp-f-network { background: #c43c3c; }
 .sp-f-blocked { background: #6b5bb5; }
 .sp-f-config { background: #4a7bb7; }
+.sp-f-empty, .sp-f-hang { background: #8a5a2b; }
+.sp-f-broken { background: #b03a6e; }
